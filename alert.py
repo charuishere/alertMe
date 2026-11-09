@@ -1,5 +1,8 @@
 """Emails me when a new, unclaimed issue shows up in the projects I follow.
-It only alerts. It never posts or comments anything."""
+It only alerts. It never posts or comments anything.
+
+With LOOP_MINUTES set it keeps checking (every LOOP_SLEEP seconds) until that time is up,
+then tells the workflow to start a new run, so a single run covers hours, not minutes."""
 import json, os, smtplib, ssl, sys, time, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -29,6 +32,8 @@ MAX_IN_EMAIL = 20
 
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
+LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "0"))
+LOOP_SLEEP = int(os.environ.get("LOOP_SLEEP", "60"))
 DEFAULT_WINDOW_MIN = 20      # first run, with no saved state
 OVERLAP_MIN = 3              # re-check a little before the last run, in case search lags
 MAX_BACK_MIN = 360           # never look back further than 6 hours
@@ -151,22 +156,18 @@ def window_start(state, now):
     return max(start, now - timedelta(minutes=MAX_BACK_MIN))
 
 
-def main():
-    if os.environ.get("TEST_EMAIL") == "true":
-        mail("Test email from the alert script",
-             "If you can read this, the Gmail login and the secrets work.\n"
-             "https://github.com/charuishere/alertMe")
-        print("test email sent")
-        return
+def run_once(state):
+    """One check. Changes `state` in place and saves it."""
+    FAILED.clear()
     now = datetime.now(timezone.utc)
-    state = load_state()
     seen = set(state.get("seen", []))
     since = window_start(state, now)
     items = [x for x in github_items(since) + jira_items(since, now) if x["id"] not in seen]
     items = [x for x in items if not x["api_url"] or still_free(x)]
-    print(f"{len(items)} new free item(s) since {since:%H:%M} UTC; failed requests: {len(FAILED)}")
+    print(f"{now:%H:%M:%S} UTC: {len(items)} new free item(s) since {since:%H:%M}; "
+          f"failed requests: {len(FAILED)}", flush=True)
     if items:
-        send(items)                  # if this raises, state is not saved and the next run retries
+        send(items)                  # if this raises, state is not saved and the next check retries
         state["last_alert"] = now.isoformat()
     last = state.get("last_alert") or state.setdefault("last_alert", now.isoformat())
     if now - datetime.fromisoformat(last) > timedelta(days=HEARTBEAT_DAYS):
@@ -179,8 +180,33 @@ def main():
         state["last_run"] = now.isoformat()
     if not DRY_RUN:
         json.dump(state, open(STATE_FILE, "w"))
-    if FAILED:                       # a red run makes GitHub email me, so a broken watcher is not silent
-        sys.exit(1)
+
+
+def main():
+    if os.environ.get("TEST_EMAIL") == "true":
+        mail("Test email from the alert script",
+             "If you can read this, the Gmail login and the secrets work.\n"
+             "https://github.com/charuishere/alertMe")
+        print("test email sent")
+        return
+    state = load_state()
+    if not LOOP_MINUTES:
+        run_once(state)
+        sys.exit(1 if FAILED else 0)
+    end = time.time() + LOOP_MINUTES * 60
+    while True:
+        try:
+            run_once(state)
+        except Exception as e:       # e.g. the mail failed: report it, keep watching
+            FAILED.append("iteration")
+            print("check failed:", type(e).__name__, e, file=sys.stderr, flush=True)
+        if time.time() + LOOP_SLEEP >= end:
+            break
+        time.sleep(LOOP_SLEEP)
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:                          # ended normally, so the workflow may start the next run
+        open(out, "a").write("restart=true\n")
+    sys.exit(1 if FAILED else 0)
 
 
 if __name__ == "__main__":
