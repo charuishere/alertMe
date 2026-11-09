@@ -111,7 +111,18 @@ def send(items):
         s.send_message(msg)
 
 
+def send_test():
+    """One-off check that the Gmail login and the secrets work."""
+    items = [{"id": "test", "name": "test", "title": "Test email from the alert script",
+              "url": "https://github.com/charuishere/alertMe", "labels": [], "priority": False}]
+    send(items)
+    print("test email sent")
+
+
 def main():
+    if os.environ.get("TEST_EMAIL") == "true":
+        send_test()
+        return
     since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MIN)
     try:
         seen = set(json.load(open(SEEN_FILE)))

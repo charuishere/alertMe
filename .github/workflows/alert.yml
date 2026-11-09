@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      test_email:
+        description: "Send a test email only"
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -10,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   alert:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +27,7 @@ jobs:
       - run: python alert.py
         env:
           LOOKBACK_MIN: "20"
+          TEST_EMAIL: ${{ inputs.test_email }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
