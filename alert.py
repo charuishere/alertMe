@@ -103,11 +103,23 @@ def send(items):
     if DRY_RUN:
         print("SUBJECT:", subject, "\n" + body)
         return
+    user = os.environ["MAIL_USER"].strip()
+    password = os.environ["MAIL_APP_PASSWORD"].replace(" ", "").strip()
     msg = EmailMessage()
-    msg["Subject"], msg["From"], msg["To"] = subject, os.environ["MAIL_USER"], os.environ["MAIL_TO"]
+    msg["Subject"], msg["From"], msg["To"] = subject, user, os.environ["MAIL_TO"].strip()
     msg.set_content(body)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
-        s.login(os.environ["MAIL_USER"], os.environ["MAIL_APP_PASSWORD"])
+    print(f"mail login: user length {len(user)}, app password length {len(password)} (should be 16)")
+    ctx = ssl.create_default_context()
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=30) as s:
+            s.login(user, password)
+            s.send_message(msg)
+        return
+    except Exception as e:
+        print("port 465 failed:", type(e).__name__, e, file=sys.stderr)
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:   # second try
+        s.starttls(context=ctx)
+        s.login(user, password)
         s.send_message(msg)
 
 
