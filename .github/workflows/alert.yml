@@ -19,16 +19,20 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         with:
-          path: seen.json
-          key: seen-${{ github.run_id }}
-          restore-keys: seen-
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
       - run: python alert.py
         env:
-          LOOKBACK_MIN: "20"
           TEST_EMAIL: ${{ inputs.test_email }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}

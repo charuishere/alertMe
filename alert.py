@@ -9,6 +9,7 @@ from email.message import EmailMessage
 # max_comments: skip issues that already have more comments than this.
 GITHUB = [
     {"query": "org:fossasia", "gfi_only": False, "max_comments": 2, "priority": True},
+    {"query": "org:kestra-io", "gfi_only": False, "max_comments": 2},
     {"query": "org:accordproject", "gfi_only": False, "max_comments": 2},
     {"query": "org:cBioPortal", "gfi_only": False, "max_comments": 2},
     {"query": "org:oppia", "gfi_only": True, "max_comments": 2},
@@ -23,11 +24,15 @@ JIRA = [
      'AND status in ("Ready for Work", "Waiting for Dev")'),
 ]
 SKIP_TITLES = ("CI Failure", "Dependency Dashboard")
+MAX_IN_EMAIL = 20
 # ------------------------------------
 
-LOOKBACK_MIN = int(os.environ.get("LOOKBACK_MIN", "20"))
-SEEN_FILE = os.environ.get("SEEN_FILE", "seen.json")
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
+DEFAULT_WINDOW_MIN = 20      # first run, with no saved state
+OVERLAP_MIN = 3              # re-check a little before the last run, in case search lags
+MAX_BACK_MIN = 360           # never look back further than 6 hours
+HEARTBEAT_DAYS = 7           # "still running" mail if nothing was sent for this long
 FAILED = []
 
 
@@ -54,7 +59,7 @@ def gh_headers():
 
 
 def still_free(item):
-    """Re-check right before alerting: no assignee and not too many comments."""
+    """Re-check right before alerting: still open and nobody assigned."""
     d = fetch(item["api_url"], gh_headers())
     return bool(d) and d.get("state") == "open" and not d.get("assignees")
 
@@ -67,7 +72,7 @@ def github_items(since):
         if s.get("gfi_only"):
             q += ' label:"good first issue"'
         d = fetch("https://api.github.com/search/issues?" +
-                  urllib.parse.urlencode({"q": q, "per_page": 30, "sort": "created"}), gh_headers())
+                  urllib.parse.urlencode({"q": q, "per_page": 100, "sort": "created"}), gh_headers())
         for i in (d or {}).get("items", []):
             if i.get("user", {}).get("type") == "Bot" or any(t in i["title"] for t in SKIP_TITLES):
                 continue
@@ -78,12 +83,13 @@ def github_items(since):
     return out
 
 
-def jira_items():
+def jira_items(since, now):
     out = []
+    minutes = int((now - since).total_seconds() // 60) + 1
     for name, base, endpoint, jql in JIRA:
-        j = f"{jql} AND created >= -{LOOKBACK_MIN}m"   # relative time avoids timezone mistakes
+        j = f"{jql} AND created >= -{minutes}m"   # relative time avoids timezone mistakes
         d = fetch(f"{base}/rest/api/2/{endpoint}?" +
-                  urllib.parse.urlencode({"jql": j, "maxResults": 30, "fields": "summary"}))
+                  urllib.parse.urlencode({"jql": j, "maxResults": 50, "fields": "summary"}))
         for i in (d or {}).get("issues", []):
             out.append({"id": f"jira:{name}:{i['key']}", "name": name,
                         "title": f"{i['key']}: {i['fields']['summary']}",
@@ -91,15 +97,7 @@ def jira_items():
     return out
 
 
-def send(items):
-    items = sorted(items, key=lambda x: not x["priority"])
-    lines = []
-    for x in items:
-        tag = "[FOSSASIA, move fast] " if x["priority"] else ""
-        lab = f" ({', '.join(x['labels'][:3])})" if x["labels"] else ""
-        lines.append(f"{tag}[{x['name']}] {x['title']}{lab}\n{x['url']}")
-    body = "New unclaimed issues (checked just now, nobody assigned):\n\n" + "\n\n".join(lines)
-    subject = f"{'FOSSASIA: ' if items[0]['priority'] else ''}{len(items)} new open-source issue(s)"
+def mail(subject, body):
     if DRY_RUN:
         print("SUBJECT:", subject, "\n" + body)
         return
@@ -108,7 +106,6 @@ def send(items):
     msg = EmailMessage()
     msg["Subject"], msg["From"], msg["To"] = subject, user, os.environ["MAIL_TO"].strip()
     msg.set_content(body)
-    print(f"mail login: user length {len(user)}, app password length {len(password)} (should be 16)")
     ctx = ssl.create_default_context()
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=30) as s:
@@ -123,31 +120,65 @@ def send(items):
         s.send_message(msg)
 
 
-def send_test():
-    """One-off check that the Gmail login and the secrets work."""
-    items = [{"id": "test", "name": "test", "title": "Test email from the alert script",
-              "url": "https://github.com/charuishere/alertMe", "labels": [], "priority": False}]
-    send(items)
-    print("test email sent")
+def send(items):
+    items = sorted(items, key=lambda x: not x["priority"])
+    lines = []
+    for x in items[:MAX_IN_EMAIL]:
+        tag = "[FOSSASIA, move fast] " if x["priority"] else ""
+        lab = f" ({', '.join(x['labels'][:3])})" if x["labels"] else ""
+        lines.append(f"{tag}[{x['name']}] {x['title']}{lab}\n{x['url']}")
+    if len(items) > MAX_IN_EMAIL:
+        lines.append(f"... and {len(items) - MAX_IN_EMAIL} more. Check the repos.")
+    body = "New unclaimed issues (checked just now, nobody assigned):\n\n" + "\n\n".join(lines)
+    subject = f"{'FOSSASIA: ' if items[0]['priority'] else ''}{len(items)} new open-source issue(s)"
+    mail(subject, body)
+
+
+def load_state():
+    try:
+        return json.load(open(STATE_FILE))
+    except Exception:
+        return {}
+
+
+def window_start(state, now):
+    if os.environ.get("LOOKBACK_MIN"):            # manual override, used for tests
+        return now - timedelta(minutes=int(os.environ["LOOKBACK_MIN"]))
+    if state.get("last_run"):
+        start = datetime.fromisoformat(state["last_run"]) - timedelta(minutes=OVERLAP_MIN)
+    else:
+        start = now - timedelta(minutes=DEFAULT_WINDOW_MIN)
+    return max(start, now - timedelta(minutes=MAX_BACK_MIN))
 
 
 def main():
     if os.environ.get("TEST_EMAIL") == "true":
-        send_test()
+        mail("Test email from the alert script",
+             "If you can read this, the Gmail login and the secrets work.\n"
+             "https://github.com/charuishere/alertMe")
+        print("test email sent")
         return
-    since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MIN)
-    try:
-        seen = set(json.load(open(SEEN_FILE)))
-    except Exception:
-        seen = set()
-    items = [x for x in github_items(since) + jira_items() if x["id"] not in seen]
+    now = datetime.now(timezone.utc)
+    state = load_state()
+    seen = set(state.get("seen", []))
+    since = window_start(state, now)
+    items = [x for x in github_items(since) + jira_items(since, now) if x["id"] not in seen]
     items = [x for x in items if not x["api_url"] or still_free(x)]
-    print(f"{len(items)} new free item(s) in the last {LOOKBACK_MIN} min; failed requests: {len(FAILED)}")
+    print(f"{len(items)} new free item(s) since {since:%H:%M} UTC; failed requests: {len(FAILED)}")
     if items:
-        send(items)
+        send(items)                  # if this raises, state is not saved and the next run retries
+        state["last_alert"] = now.isoformat()
+    last = state.get("last_alert") or state.setdefault("last_alert", now.isoformat())
+    if now - datetime.fromisoformat(last) > timedelta(days=HEARTBEAT_DAYS):
+        mail("alert script is still running",
+             f"No new issue alerts for {HEARTBEAT_DAYS} days. This is only a check that it is alive.")
+        state["last_alert"] = now.isoformat()
+    seen.update(x["id"] for x in items)
+    state["seen"] = sorted(seen)[-3000:]
+    if not FAILED:                   # after a failed request, keep the old window so nothing is lost
+        state["last_run"] = now.isoformat()
     if not DRY_RUN:
-        seen.update(x["id"] for x in items)
-        json.dump(sorted(seen)[-3000:], open(SEEN_FILE, "w"))
+        json.dump(state, open(STATE_FILE, "w"))
     if FAILED:                       # a red run makes GitHub email me, so a broken watcher is not silent
         sys.exit(1)
 
