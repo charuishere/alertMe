@@ -12,20 +12,27 @@ from email.message import EmailMessage
 # max_comments: skip issues that already have more comments than this.
 GITHUB = [
     {"query": "org:fossasia", "gfi_only": False, "max_comments": 2, "priority": True},
-    {"query": "org:kestra-io", "gfi_only": False, "max_comments": 2},
+    # Kestra's bot puts "not ready" in the body of issues the team has not opened up yet, and removes it when it
+    # moves the issue to Backlog. That is an edit, so for Kestra we search by "updated", not "created".
+    {"query": "org:kestra-io", "gfi_only": False, "max_comments": 2,
+     "skip_body_marker": "kestra-bot:not-ready", "by": "updated"},
     {"query": "org:accordproject", "gfi_only": False, "max_comments": 2},
     {"query": "org:cBioPortal", "gfi_only": False, "max_comments": 2},
     {"query": "org:oppia", "gfi_only": True, "max_comments": 2},
 ]
 JIRA = [
-    # (name, base url, search endpoint, JQL without the time part)
+    # (name, base url, search endpoint, JQL without the time part, max comments or None)
+    # Fineract people claim a ticket by commenting, not by being assigned, so skip tickets with comments.
     ("Fineract", "https://issues.apache.org/jira", "search",
      'project = FINERACT AND resolution = Unresolved AND assignee is EMPTY '
-     'AND labels in (beginner, beginner-friendly)'),
+     'AND labels in (beginner, beginner-friendly)', 0),
     ("OpenMRS", "https://openmrs.atlassian.net", "search/jql",
      'project = TRUNK AND resolution = Unresolved AND assignee is EMPTY '
-     'AND status in ("Ready for Work", "Waiting for Dev")'),
+     'AND status in ("Ready for Work", "Waiting for Dev")', None),
 ]
+# Jira source name -> GitHub repo to search for a pull request that already mentions the ticket key.
+# People often open a PR without commenting on the ticket, so the comment filter alone is not enough.
+JIRA_PR_REPO = {"Fineract": "apache/fineract"}
 SKIP_TITLES = ("CI Failure", "Dependency Dashboard")
 MAX_IN_EMAIL = 20
 # ------------------------------------
@@ -69,18 +76,36 @@ def still_free(item):
     return bool(d) and d.get("state") == "open" and not d.get("assignees")
 
 
+def has_pr(item):
+    """True if an open or merged PR already mentions this Jira ticket, None if the lookup failed."""
+    repo = JIRA_PR_REPO.get(item["name"])
+    if not repo or not item["id"].startswith("jira:"):
+        return False
+    key = item["id"].split(":")[-1]
+    time.sleep(2)                                    # stay under the search rate limit
+    d = fetch("https://api.github.com/search/issues?" +
+              urllib.parse.urlencode({"q": f"repo:{repo} type:pr {key} in:title,body", "per_page": 30}), gh_headers())
+    if d is None:
+        return None
+    return any(i.get("state") == "open" or (i.get("pull_request") or {}).get("merged_at")
+               for i in d.get("items", []))
+
+
 def github_items(since):
     out = []
     for s in GITHUB:
+        by = s.get("by", "created")
         q = (f'{s["query"]} is:issue is:open no:assignee -linked:pr '
-             f'comments:0..{s["max_comments"]} created:>={since:%Y-%m-%dT%H:%M:%SZ}')
+             f'comments:0..{s["max_comments"]} {by}:>={since:%Y-%m-%dT%H:%M:%SZ}')
         if s.get("gfi_only"):
             q += ' label:"good first issue"'
         d = fetch("https://api.github.com/search/issues?" +
-                  urllib.parse.urlencode({"q": q, "per_page": 100, "sort": "created"}), gh_headers())
+                  urllib.parse.urlencode({"q": q, "per_page": 100, "sort": by}), gh_headers())
         for i in (d or {}).get("items", []):
             if i.get("user", {}).get("type") == "Bot" or any(t in i["title"] for t in SKIP_TITLES):
                 continue
+            if s.get("skip_body_marker") and s["skip_body_marker"] in (i.get("body") or ""):
+                continue                   # the team has not opened this issue for contributors yet
             out.append({"id": f"gh:{i['id']}", "name": i["repository_url"].split("repos/")[-1],
                         "title": i["title"], "url": i["html_url"], "api_url": i["url"],
                         "labels": [l["name"] for l in i["labels"]], "priority": s.get("priority", False)})
@@ -91,11 +116,13 @@ def github_items(since):
 def jira_items(since, now):
     out = []
     minutes = int((now - since).total_seconds() // 60) + 1
-    for name, base, endpoint, jql in JIRA:
+    for name, base, endpoint, jql, max_comments in JIRA:
         j = f"{jql} AND created >= -{minutes}m"   # relative time avoids timezone mistakes
         d = fetch(f"{base}/rest/api/2/{endpoint}?" +
-                  urllib.parse.urlencode({"jql": j, "maxResults": 50, "fields": "summary"}))
+                  urllib.parse.urlencode({"jql": j, "maxResults": 50, "fields": "summary,comment"}))
         for i in (d or {}).get("issues", []):
+            if max_comments is not None and (i["fields"].get("comment") or {}).get("total", 0) > max_comments:
+                continue
             out.append({"id": f"jira:{name}:{i['key']}", "name": name,
                         "title": f"{i['key']}: {i['fields']['summary']}",
                         "url": f"{base}/browse/{i['key']}", "api_url": None, "labels": [], "priority": False})
@@ -164,6 +191,7 @@ def run_once(state):
     since = window_start(state, now)
     items = [x for x in github_items(since) + jira_items(since, now) if x["id"] not in seen]
     items = [x for x in items if not x["api_url"] or still_free(x)]
+    items = [x for x in items if has_pr(x) is False]      # skip tickets with a PR; retry later if the lookup failed
     print(f"{now:%H:%M:%S} UTC: {len(items)} new free item(s) since {since:%H:%M}; "
           f"failed requests: {len(FAILED)}", flush=True)
     if items:
